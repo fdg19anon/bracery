@@ -1,0 +1,445 @@
+#!/usr/bin/env node
+// emacs mode -*-JavaScript-*-
+
+var fs = require('fs'),
+    getopt = require('node-getopt'),
+    readline = require('readline'),
+    http = require('http'),
+    request = require('request'),
+    keypress = require('keypress'),
+    colors = require('colors'),
+    MersenneTwister = require('mersenne-twister')
+
+var bracery = require('..'),
+    extend = bracery.ParseTree.extend,
+    Validator = require('../src/validator')
+
+// parse command-line options
+var opt = getopt.create([
+  ['d' , 'defs=PATH+'       , 'load symbol definitions from Tracery JSON file(s)'],
+  ['s' , 'symbols=EXPR+'    , 'specify Tracery JSON symbol definitions from command line'],
+  ['E' , 'evalsym=EXPR+'    , 'evaluate Tracery symbol definitions as JavaScript from command line (use with caution!)'],
+  ['b' , 'bracery'          , 'convert Tracery symbol definitions to Bracery'],
+  ['B' , 'output-bracery=PATH', 'save symbol definitions to Bracery file'],
+  ['o' , 'output-json=PATH' , 'save symbol definitions to Tracery JSON file'],
+  ['O' , 'output-text=PATH' , 'save symbol definitions in deprecated/secret one-line-per-option format'],
+  ['f' , 'file=PATH+'       , 'evaluate Bracery expression text from file(s)'],
+  ['e' , 'eval=EXPR+'       , 'evaluate Bracery expression(s) text from comand line'],
+  ['n' , 'num=NUMBER'       , 'number of randomized samples to output'],
+  ['c' , 'config=JSON'      , 'specify config params (e.g. maxDepth, maxRecursion, maxLength, maxNodes, maxReps)'],
+  ['V' , 'validate=EXPR+'   , 'validate and normalize text, without expanding'],
+  ['t' , 'tree'             , 'show parse tree'],
+  ['T' , 'compact-tree'     , 'like --tree, but compact'],
+  ['a' , 'async'            , 'run asynchronously'],
+  ['R' , 'seed=NUMBER'      , 'seed random number generator'],
+  ['r' , 'repl'             , 'enter Read-Evaluate-Print Loop (REPL)'],
+  ['S' , 'server=SOCKET'    , 'run as a web service'],
+  ['C' , 'client=URL'       , 'run as client of web service'],
+  ['m' , 'markov=FILE'      , 'run as Markov chain from template file'],
+  ['q' , 'quiz=FILE'        , 'like --markov, but interactive'],
+  ['v' , 'verbose=NUM'      , 'print logging info'],
+  ['h' , 'help'             , 'display this help message']
+])              // create Getopt instance
+    .bindHelp()     // bind option 'help' to default action
+    .parseSystem() // parse command line
+
+var seed = opt.options.seed || Math.floor (Math.random() * 0x7fffffff)
+var mt = new MersenneTwister (seed)
+var rng = (opt.options.verbose < 0
+           ? function() { var r = mt.random(); console.warn('MersenneTwister',r); return r }
+           : mt.random.bind(mt))
+
+var b = new bracery.Bracery (null, { rng: rng })
+
+var varVal = {}
+function makeConfig() {
+  var config = { vars: extend ({}, varVal),
+                 rng: rng }
+  if (opt.options.config)
+    extend (config, JSON.parse (opt.options.config))
+  if (opt.options.verbose)
+    config.verbose = opt.options.verbose
+  return config
+}
+
+// logging
+var before = {}, after = {}
+if (opt.options.verbose > 1) {
+  //  before.all = console.warn.bind (console, 'before node,varval,depth:')
+  before.all = function(node,vars,depth) { console.warn ('before node,varval,depth:', JSON.stringify(node),vars,depth) }
+  after.all = console.warn.bind (console, 'after node,varval,depth,expansion:')
+  if (opt.options.async || opt.options.client) {
+    before.expand = console.warn.bind (console, 'before_expand node,varval,depth:')
+    after.expand = console.warn.bind (console, 'after_expand node,varval,depth,rhs:')
+  }
+}
+
+// simple client/server
+var async = opt.options.async, symbolExpander
+if (opt.options.client) {
+  async = true
+  symbolExpander = function (config) {
+    return new Promise (function (resolve, reject) {
+      request.post ({ url: opt.options.client,
+                      json: true,
+                      body: { text: bracery.ParseTree.symChar + config.node.name.toLowerCase() } },
+                    function (err, res, body) {
+                      if (err)
+                        reject (err)
+                      else if (!(body.expansion && body.expansion.tree[0]))
+                        reject (body)
+                      else
+                        resolve (body.expansion.tree[0].rhs)
+                    })
+    })
+  }
+  console.warn ('resolving symbols via ' + opt.options.client)
+}
+
+if (opt.options.server) {
+  function requestHandler (request, response) {
+    var body = ''
+    request.on ('data', function (chunk) { body += chunk.toString() })
+    request.on ('end', function() {
+      var text = JSON.parse(body).text
+      console.warn ('> ' + text)
+      b.expand (text,
+                extend (makeConfig(),
+                        { before: before,
+                          after: after,
+                          callback: function (expansion) {
+                            console.warn ('< ' + expansion.text)
+                            response.end (JSON.stringify ({ expansion: expansion }))
+                          } }))
+    })
+  }
+  
+  var server = http.createServer (requestHandler)
+  server.listen (opt.options.server, function (err) {
+    if (err)
+      throw err
+  })
+  console.warn ('listening on port ' + opt.options.server)
+}
+
+// main expand function: performs n expansions, synchronously or asynchronously,
+// and outputs the result as text or a tree
+var samples = parseInt(opt.options.num) || 1
+var tree = opt.options.tree, compact = opt.options['compact-tree']
+function expansionLogger (n, outputColor, expansion) {
+  if (opt.options.verbose)
+    console.warn ('expansion' + (samples > 1 ? (' (' + (n+1) + '/' + samples + ')') : ''), expansion)
+  console.log ((outputColor || noColor).call
+               (colors,
+                (tree || compact
+                 ? ((n ? ',' : '[')
+                    + JSON.stringify(expansion,null,opt.options['compact-tree'] ? 0 : 2)
+                    + (n == samples-1 ? ']' : ''))
+                 : expansion.text)))
+  if (expansion)
+    varVal = expansion.vars
+}
+function noColor (text) { return text }
+
+var printedSomething = false
+function expand (expr, outputColor) {
+  if (opt.options.verbose)
+    console.warn (colors.yellow ('Expand'), ' ', colors.blue (expr))
+  for (var n = 0; n < samples; ++n) {
+    var gotExpansion = expansionLogger.bind (null, n, outputColor)
+    var config = makeConfig()
+    if (symbolExpander)
+      config.expand = symbolExpander
+    if (async)
+      b.expand (expr, extend (config,
+                              { before: before,
+                                after: after,
+                                callback: gotExpansion }))
+    else
+      gotExpansion (b.expand (expr, extend (config, { beforeSync: before,
+                                                      afterSync: after })))
+    printedSomething = true
+  }
+}
+
+// load symbol definitions
+var addedRules = false
+function addRules (rules) {
+  var r = b.addRules (rules)
+  if (Object.keys(rules).length)
+    addedRules = true
+  return r
+}
+function addRulesEval (rulesExpr) {
+  return addRules (eval ('(' + rulesExpr + ')'))
+}
+function addRulesTracery (rulesJSON) {
+  return addRules (JSON.parse (rulesJSON))
+}
+function addRulesText (ruleText) {
+  return addRules (bracery.ParseTree.parseTextDefs (ruleText))
+}
+function addRulesFile (filename) {
+  var text = fs.readFileSync (filename).toString()
+  var result
+  try {
+    var json = JSON.parse (text), rules
+    if (Validator.isTracery (json))
+      rules = json
+    else if (Validator.isBraceryJSON (json)) {
+      rules = {}
+      json.forEach (function (symbol) { rules[symbol.name] = symbol.rules.map (function (array) { return array[0] }) })
+    } else {
+      var errs = bracery.Validator.validateTracery(json).errors.map (function (ve) { return ve.stack }).join("\n")
+      console.warn (filename + ' is apparently JSON, but is not valid Tracery:\n' + errs)
+      throw new Error()  // delegate to addRulesText
+    }
+    result = addRules (rules)
+  } catch (e) {
+    result = addRulesText (text)
+    if (Object.keys(result).length === 0) {
+      opt.options.file = opt.options.file || []
+      opt.options.file.push (filename)
+    }
+  }
+  return result
+}
+if (opt.options.defs)
+  opt.options.defs.forEach (addRulesFile)
+if (opt.options.symbols)
+  opt.options.symbols.forEach (addRulesTracery)
+opt.argv.forEach (addRulesFile)
+if (opt.options.evalsym)
+  opt.options.evalsym.forEach (addRulesEval)
+
+// print a log message about the symbol defs
+var symbolNames = b.symbolNames()
+if (symbolNames.length || opt.options.defs) {
+  var nRules = symbolNames.reduce (function (sum, name) { return sum + b.getRules(name).length }, 0)
+  console.warn(colors.cyan ('(' + bracery.ParseTree.nPlurals(symbolNames.length,'symbol')
+                            + ', ' + bracery.ParseTree.nPlurals(nRules,'rule')
+                            + ', default symbol ' + bracery.ParseTree.symChar + b.getDefaultSymbol()
+                            + ', random seed ' + seed + ')'))
+}
+
+// output symbol defs
+if (opt.options['output-json']) {
+  fs.writeFileSync (opt.options['output-json'], JSON.stringify (b.toJSON(), null, 2))
+  printedSomething = true
+}
+
+if (opt.options['output-text']) {
+  fs.writeFileSync (opt.options['output-text'], b.toText())
+  printedSomething = true
+}
+
+// validate expressions
+if (opt.options.validate)
+  opt.options.validate.forEach (function (expr) {
+    console.log (tree
+                 ? JSON.stringify (b.parse (expr), null, 2)
+                 : (compact
+                    ? JSON.stringify (b.parse (expr))
+                    : b.normalize (expr)))
+    printedSomething = true
+  })
+
+// evaluate any expressions
+if (opt.options.file)
+  opt.options.file.forEach (function (filename) {
+    expand (fs.readFileSync (filename).toString())
+  })
+
+if (opt.options.eval)
+  opt.options.eval.forEach (function (text) { return expand(text) })
+
+// run template Markov chain
+function tagsString (message) { return bracery.Template.makeTagArray(message.tags).join(' ') }
+function varsString (nv) {
+  var nextVars = {}
+  if (nv) {
+    nextVars = extend (nextVars, nv)
+    delete nextVars.prevtags
+  }
+  return '{' + Object.keys(nextVars).map(function(n){return n+':'+JSON.stringify(nextVars[n])}).join(',') + '}'
+}
+if (opt.options.markov || opt.options.quiz) {
+  function messageToString (message, config) {
+    var color = (config && config.color) || {}
+    return ((message.template.title && color.title
+               ? (color.title.call (colors, '[' + message.template.title + ']') + ' ')
+               : '')
+            + (message.template.author && color.author
+               ? (color.author.call (colors, message.template.author) + ': ')
+               : '')
+            + (color.message || noColor).call (colors, message.expansion.text)
+            + (message.tags.match(/\S/) && color.tags
+               ? (' ' + color.tags.call (colors, tagsString(message)))
+               : '')
+            + (message.vars && color.vars
+               ? (' ' + color.vars.call (colors, varsString(message.vars)))
+               : '')
+            + (message.nextVars && color.nextVars
+               ? (' ' + color.nextVars.call (colors, varsString(message.nextVars)))
+               : '')
+            + '\n')
+  }
+  function chainToString (chain, config) {
+    return chain.map (function (message) { return messageToString (message, config) }).join('')
+  }
+  function parseTemplates (text) {
+    var templates
+    try {
+      templates = JSON.parse (text)
+    } catch (e) {
+      templates = bracery.Template.parseTemplateDefs (text)
+    }
+    return bracery.Template.flattenTemplates (templates)
+  }
+  var templates = [opt.options.markov, opt.options.quiz]
+      .reduce (function (temps, filename) {
+        return temps.concat (filename ? parseTemplates (fs.readFileSync (filename).toString()) : [])
+      }, [])
+
+  var markovConfig = extend (makeConfig(),
+                             { bracery: b,
+                               templates: templates,
+                               vars: varVal })
+  if (opt.options.quiz) {
+    markovConfig.accept = function (message, thread, callback, templateListCallback) {
+      if (!(opt.options.verbose > 1))
+        console.log ('\033c')  // clear screen
+      if (thread)
+        console.warn (chainToString (thread,
+                                     { color: { title: null,
+                                                author: colors.blue,
+                                                message: colors.white } }))
+      var varsColor = colors.yellow, nextVarsColor = colors.red, tagsColor = colors.cyan
+      console.warn (messageToString
+                    (message,
+                     { color: { title: function (text) { return colors.magenta (text) + '\n' },
+                                author: colors.blue,
+                                message: colors.white,
+                                tags: opt.options.verbose ? tagsColor : undefined,
+                                vars: opt.options.verbose > 1 ? varsColor : undefined,
+                                nextVars: opt.options.verbose > 1 ? nextVarsColor : undefined} }))
+      process.stdout.write (colors.bold('Accept?') + ' ' + colors.gray('(Y/n)') + ' ')
+
+      keypress (process.stdin)
+      function pause() {
+        process.stdout.write ('\n')
+        process.stdin.removeListener ('keypress', handleKey)
+        process.stdin.pause()
+      }
+      var debug = 0
+      var templateList, defaultSelection
+      function handleKey (ch, key) {
+        var result
+        if (key) {
+          if (key.name === 'q' || (key.ctrl && key.name === 'c'))  // handle ctrl-C
+            pause()
+          if (key.name === 'y' || key.name === 'return' || key.name === 'space' || key.name === 'down' || key.name === 'right')
+            result = true
+          if (key.name === 'n' || key.name === 'backspace' || key.name === 'up' || key.name === 'left')
+            result = false
+          if (key.name === 't')
+            console.warn (tagsColor.call (colors, (debug++ ? '' : '\n') + tagsString(message)))
+          if (key.name === 'v')
+            console.warn (varsColor.call (colors, (debug++ ? '' : '\n') + varsString(message)))
+          if (key.name === 's') {
+            if (!templateList) {
+              templateList = templateListCallback()
+              for (var n = 0; n < templateList.length; ++n) {
+                if (templateList[n].template === message.template) {
+                  templateList = templateList.slice(n).concat (templateList.slice(0,n));
+                  break;
+                }
+              }
+            }
+            if (templateList) {
+              console.warn (templateList.map (function (template, n) {
+                var result = ('\n' + (n+1) + '. '
+                              + colors.blue (template.author ? ('@' + template.author) : '')
+                              + colors.magenta ('>' + template.title)
+                              + tagsColor.call (colors, ' #' + template.previousTags + '#' + template.tags))
+                if (template === message.template) {
+                  defaultSelection = template
+                  result = colors.inverse(result)
+                }
+                return result
+              }).join(''))
+              console.warn ('Select a template:')
+              result = templateList
+            }
+          }
+        }
+        if (typeof(result) !== 'undefined') {
+          pause()
+          if (result.length) {
+            process.stdin.setRawMode(false)
+            process.stdin.resume()
+            var rl = readline.createInterface ({
+              input: process.stdin,
+              output: process.stdout,
+              terminal: false
+            })
+            rl.on ('line', function (line) {
+              var choice = parseInt (line)
+              process.stdin.pause()
+              process.stdin.setRawMode(true)
+              callback ((choice > 0 && choice <= result.length)
+                        ? result[choice - 1]
+                        : defaultSelection)
+            })
+          } else
+            callback (result)
+        }
+      }
+      process.stdin.addListener ('keypress', handleKey)
+      process.stdin.setRawMode(true)
+      process.stdin.resume()
+    }
+  } else
+    markovConfig.accept = function (message, thread, callback, templateListCallback) {
+      callback (rng() < .5)
+    }
+
+  bracery.Template.promiseMessageList (markovConfig)
+    .then (function (chain) {
+      console.log (chainToString (chain,
+                                  { color: { title: colors.magenta,
+                                             author: colors.blue,
+                                             message: colors.white,
+                                             tags: opt.options.verbose ? colors.cyan : undefined,
+                                             nextVars: opt.options.verbose > 1 ? colors.red : undefined,
+                                             vars: opt.options.verbose > 1 ? colors.yellow : undefined } }))
+    })
+  printedSomething = true
+}
+
+// output current state
+function currentState() { return b.toBracery() + b.varsToBracery(varVal) }
+if (opt.options['output-bracery']) {
+  fs.writeFileSync (opt.options['output-bracery'], currentState())
+  printedSomething = true
+}
+
+if (opt.options.bracery) {
+  console.log (currentState())
+  printedSomething = true
+}
+
+// start a REPL
+if (opt.options.repl) {
+  console.warn (colors.green ('enter Bracery text for expansion:'))
+  var rl = readline.createInterface ({ input: process.stdin,
+                                       output: process.stdout })
+  rl.on ('line', function (expr) { expand (expr, colors.yellow) })
+}
+
+// expand something by default, or print an error message
+if (addedRules && !printedSomething && !opt.options.server && !opt.options.repl)
+    expand()
+
+if (!printedSomething && !addedRules && !opt.options.server && !opt.options.repl)
+  console.error ('please give me some Bracery text to expand')
