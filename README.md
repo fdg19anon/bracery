@@ -2,6 +2,7 @@
 [![Build Status](https://travis-ci.org/ihh/bracery.svg?branch=master)](https://travis-ci.org/ihh/bracery)
 [![Coverage Status](https://coveralls.io/repos/github/ihh/bracery/badge.svg?branch=master)](https://coveralls.io/github/ihh/bracery?branch=master)
 
+
 # Bracery
 
 Bracery is a small language for procedural text generation.
